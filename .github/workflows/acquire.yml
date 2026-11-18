@@ -1,0 +1,78 @@
+name: Web acquisition
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation
+        type: choice
+        required: true
+        default: preflight
+        options: [preflight, advance]
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: web-single-writer
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.event_name == 'workflow_dispatch' || vars.WEB_AUTOMATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      WEB_OPERATION: ${{ inputs.operation || 'advance' }}
+      WEB_BUCKET: ${{ vars.WEB_BUCKET }}
+      WEB_DATASET: ${{ vars.WEB_DATASET }}
+      WEB_BUNDLE_SHA256: ${{ vars.WEB_BUNDLE_SHA256 }}
+      WEB_ROOT: ${{ secrets.WEB_ROOT }}
+      WEB_NAMESPACE: ${{ vars.WEB_NAMESPACE }}
+      WEB_MODE: ${{ vars.WEB_MODE }}
+      WEB_WORK_SECONDS: ${{ vars.WEB_WORK_SECONDS }}
+      FORESEEBENCH_WEB_MODEL_RELAY: '1'
+      FORESEEBENCH_WEB_RELAY_SECRET: ${{ secrets.WEB_RELAY_SECRET }}
+      FORESEEBENCH_WEB_RELAY_BUCKET: ${{ vars.WEB_BUCKET }}
+      FORESEEBENCH_WEB_RELAY_JOB: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+    steps:
+      - name: Obtain short-lived resource-scoped credentials
+        shell: python3 {0}
+        run: |
+          import json, os, urllib.parse, urllib.request
+          env = os.environ
+          request = urllib.request.Request(env["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&" + urllib.parse.urlencode({"audience":"https://huggingface.co"}),
+                                           headers={"Authorization": "Bearer " + env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          identity = json.load(urllib.request.urlopen(request, timeout=30))["value"]
+          with open(env["GITHUB_ENV"],"a") as out:
+              for key, target in [("HF_TOKEN","buckets/"+env["WEB_BUCKET"]),("WEB_DATASET_TOKEN","datasets/"+env["WEB_DATASET"])]:
+                  body = {"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange","subject_token_type":"urn:ietf:params:oauth:token-type:id_token",
+                          "subject_token":identity,"resource":target}
+                  req = urllib.request.Request("https://huggingface.co/oauth/token",data=json.dumps(body).encode(),headers={"Content-Type":"application/json"})
+                  token = json.load(urllib.request.urlopen(req,timeout=30))["access_token"]
+                  print("::add-mask::"+token,flush=True)
+                  out.write(key+"="+token+"\n")
+      - name: Verify and run the private acquisition release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python3 -m venv bootstrap
+          bootstrap/bin/pip --disable-pip-version-check -q install huggingface-hub==2.4.0 uv==0.13.7
+          export PATH="$RUNNER_TEMP/bootstrap/bin:$PATH"
+          python - <<'PY'
+          import hashlib, os, re, tarfile
+          from pathlib import Path
+          from huggingface_hub import HfApi
+          digest=os.environ["WEB_BUNDLE_SHA256"]
+          assert re.fullmatch("[a-f0-9]{64}",digest)
+          p=Path("release.tar.gz")
+          HfApi().download_bucket_files(os.environ["WEB_BUCKET"],[("releases/"+digest+".tar.gz",p)],raise_on_missing_files=True)
+          if hashlib.sha256(p.read_bytes()).hexdigest()!=digest:raise SystemExit("release checksum mismatch")
+          with tarfile.open(p) as tar:tar.extractall("web",filter="data")
+          PY
+          cd web
+          bash deploy/web_actions/run.sh
